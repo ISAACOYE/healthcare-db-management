@@ -1,0 +1,597 @@
+---
+title: "Function Sandbox"
+output: html_notebook
+
+---
+
+### Replace This Code With Your Database Details and Postgres User
+- NOTE: FOR windows subsystem linux users (UBUNTU) the ubuntu terminal used to install / setup postgres must be running to connect to your database
+```{r}
+# Replace with your actual database details
+con <- dbConnect(
+  RPostgres::Postgres(),
+  dbname = "DataManagement_Database_Project",   # Name of the database
+  host = "localhost",              # For local database
+  port = 5432,                     # Default PostgreSQL port
+  user = "[INSERT_USERNAME]",          # Your PostgreSQL username
+  password = "[INSERT_PASSWORD]"       # Your PostgreSQL password
+)
+
+```
+
+### Example of Using a Query to Pull Table Data
+```{r}
+# A sample that lets you pull data as a table directly into R for easy viewing
+two_activity <- dbGetQuery(con, "SELECT * FROM get_participant_activity_data(2);")
+two_food <- dbGetQuery(con, "SELECT * FROM get_participant_food_data(2);")
+participant <- dbGetQuery(con, "SELECT * FROM participant")
+```
+
+
+# Functions Block [Run this Block to Load all of the Functions at Once]
+```{r, echo=FALSE}
+## Libraries used to run all of the functions / code
+library(DBI)
+library(RPostgres)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+library(tidyr)
+library(reshape2)
+library(cluster)
+library(plotly)
+library(viridis)
+
+plot_glucose_readings <- function(data, food_log_datetime_clean, interval_before = 1800, interval_after = 14400) {
+  # Clean and prepare the dataset
+  data <- data %>%
+    mutate(
+      # Remove underscore and subsequent information from IDs
+      dexcom_id_clean = sub("_.*", "", dexcom_id),
+      food_log_id_clean = sub("_.*", "", food_log_id),
+      
+      # Convert cleaned IDs to datetime format
+      dexcom_datetime_clean = as.POSIXct(dexcom_id_clean, format = "%Y-%m-%d %H:%M:%S"),
+      food_log_datetime_clean = as.POSIXct(food_log_id_clean, format = "%Y-%m-%d %H:%M:%S")
+    ) %>%
+    mutate(
+      # Ensure datetime columns are properly parsed
+      dexcom_datetime_clean = as.POSIXct(dexcom_datetime_clean, format = "%Y-%m-%d %H:%M:%S"),
+      food_log_datetime_clean = as.POSIXct(food_log_datetime_clean, format = "%Y-%m-%d %H:%M:%S")
+    )
+  
+  # Convert input datetime to POSIXct
+  food_log_datetime_clean <- as.POSIXct(food_log_datetime_clean, format = "%Y-%m-%d %H:%M:%S")
+  
+  # Calculate the start and end of the interval
+  interval_start <- food_log_datetime_clean - interval_before
+  interval_end <- food_log_datetime_clean + interval_after
+  
+  # Filter data for glucose readings within the interval
+  selected_data <- data %>%
+    filter(
+      !is.na(dexcom_datetime_clean) &
+      !is.na(glucose_value_mgdl) &
+      dexcom_datetime_clean >= interval_start &
+      dexcom_datetime_clean <= interval_end
+    )
+  
+  # Check if there are glucose readings in the interval
+  if (nrow(selected_data) > 0) {
+    # Find the earliest dexcom_datetime_clean as the zero point
+    earliest_time <- min(selected_data$dexcom_datetime_clean, na.rm = TRUE)
+    
+    # Calculate relative time based on the earliest dexcom_datetime_clean
+    selected_data <- selected_data %>%
+      mutate(relative_time = as.numeric(difftime(dexcom_datetime_clean, earliest_time, units = "mins")))
+    
+    # Calculate the relative time of the initial food_log_datetime_clean
+    food_relative_time <- as.numeric(difftime(food_log_datetime_clean, earliest_time, units = "mins"))
+    
+    # Find additional meals registered within the interval
+    additional_meals <- data %>%
+      filter(
+        !is.na(food_log_datetime_clean) &
+        food_log_datetime_clean > food_log_datetime_clean[1] &  # Compare against the original input
+        food_log_datetime_clean >= interval_start &             # Within interval
+        food_log_datetime_clean <= interval_end
+      ) %>%
+      mutate(relative_time = as.numeric(difftime(food_log_datetime_clean, earliest_time, units = "mins")))
+    
+    # Debug: Print additional meals found
+    if (nrow(additional_meals) > 0) {
+      print("Additional meals identified (marked in purple lines):")
+      print(additional_meals)
+    } else {
+      print("No additional meals identified.")
+    }
+    
+    # Plot the glucose values
+    plot <- ggplot(selected_data, aes(x = relative_time, y = glucose_value_mgdl)) +
+      geom_line(color = "blue", alpha = 0.01) +
+      geom_point(color = "red", size = 1, alpha = 0.02) +
+      geom_vline(xintercept = food_relative_time, color = "turquoise", linetype = "dashed", linewidth = 1.4) +
+      geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), se = FALSE, color = "#15616d", size = 1.2, alpha = 0.8) +
+      labs(
+        title = paste("Glucose Readings Relative to Food Log at", food_log_datetime_clean),
+        x = "Time Since Earliest Reading (minutes)",
+        y = "Glucose Level (mg/dL)"
+      ) +
+      theme_minimal() +
+      theme(
+        panel.grid = element_line(color = "gray95", size = 0.1),  # Muted gridlines
+        panel.grid.major = element_line(color = "gray95", size = 0.1),
+        panel.grid.minor = element_blank(),                         # No minor gridlines
+        axis.line = element_line(color = "black", size = 0.8),      # Add axis lines
+        panel.border = element_blank()                              # Remove full panel border
+      )
+    
+    # Add vertical lines for additional meals
+    if (nrow(additional_meals) > 0) {
+      for (i in 1:nrow(additional_meals)) {
+        meal_time <- additional_meals$relative_time[i]
+        plot <- plot +
+          geom_vline(xintercept = meal_time, color = "purple", alpha = 0.4, linetype = "dotted", size = 1)
+      }
+    }
+    
+    # Print the plot
+    print(plot)
+  } else {
+    print("No matching glucose readings found within the specified interval.")
+  }
+}
+
+# Function to bin magnitudes and analyze glucose levels
+analyze_magnitude_glucose <- function(data, bin_width = 5) {
+  
+    # Ensure avg_magnitude is numeric and remove NA values
+  data <- data %>%
+    filter(!is.na(avg_magnitude) & is.finite(avg_magnitude))
+  
+  # Create bins based on specified bin width
+  data <- data %>%
+    mutate(magnitude_bin = cut(avg_magnitude,
+                               breaks = seq(floor(min(avg_magnitude, na.rm = TRUE)),
+                                            ceiling(max(avg_magnitude, na.rm = TRUE)),
+                                            by = bin_width),
+                               include.lowest = TRUE)) %>%
+    group_by(magnitude_bin) %>%
+    summarise(avg_glucose = mean(glucose_value_mgdl, na.rm = TRUE),
+              count = n(),
+              .groups = "drop")
+  
+  # Visualization
+  ggplot(data, aes(x = magnitude_bin, y = avg_glucose)) +
+    geom_bar(stat = "identity", fill = "skyblue") +
+    labs(title = "Average Glucose Levels by Magnitude Bins",
+         x = "Magnitude Bins",
+         y = "Average Glucose Level (mg/dL)") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+# Function to filter by time interval and plot glucose, activity intensity, and average magnitude
+glucose_v_activity <- function(data, start_time, end_time) {
+  
+  # Convert datetime to POSIXct for filtering
+  data <- data %>%
+    mutate(dexcom_datetime = as.POSIXct(dexcom_datetime, format = "%Y-%m-%d %H:%M:%S"))
+  
+  # Drop rows with NA values in key columns
+  clean_data <- data %>%
+    filter(!is.na(glucose_value_mgdl) & 
+           !is.na(avg_magnitude) & 
+           !is.na(activity_intensity_score))
+  
+  # Filter data based on the given time interval
+  filtered_data <- clean_data %>%
+    filter(dexcom_datetime >= as.POSIXct(start_time) &
+           dexcom_datetime <= as.POSIXct(end_time))
+  
+  # Check if filtered data is non-empty
+  if (nrow(filtered_data) == 0) {
+    stop("No data available in the selected time interval.")
+  }
+  
+  # Melt data for plotting
+  plot_data <- filtered_data %>%
+    select(dexcom_datetime, glucose_value_mgdl, activity_intensity_score, avg_magnitude) %>%
+    tidyr::pivot_longer(cols = c(glucose_value_mgdl, activity_intensity_score, avg_magnitude),
+                        names_to = "Variable", values_to = "Value")
+  
+  # Plot the data
+  ggplot(plot_data, aes(x = dexcom_datetime, y = Value, color = Variable)) +
+    geom_line() +
+    labs(title = "Glucose, Activity Intensity, and Magnitude Over Time",
+         x = "Time",
+         y = "Values",
+         color = "Metric") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+generate_food_analysis <- function(participant_ids, con) {
+  # Initialize an empty list to store all plots
+  plots_list <- list()
+  
+  # Loop through each participant ID
+  for (participant_id in participant_ids) {
+    # Query the database for the participant's food data
+    query <- paste0("SELECT * FROM get_participant_food_data(", participant_id, ");")
+    food_data <- suppressMessages(dbGetQuery(con, query))
+    
+    # Ensure food_data is not empty
+    if (nrow(food_data) == 0) {
+      warning(paste("No food data available for participant", participant_id))
+      next
+    }
+
+    # Aggregate data by 'food_log_date'
+    daily_totals <- suppressMessages(
+      food_data %>%
+        mutate(food_log_date = as.Date(food_log_date)) %>%
+        group_by(food_log_date) %>%
+        summarise(
+          total_calories = sum(calorie, na.rm = TRUE),
+          total_carbs = sum(total_carb, na.rm = TRUE),
+          total_sugar = sum(sugar, na.rm = TRUE),
+          total_fiber = sum(dietary_fiber, na.rm = TRUE),
+          total_protein = sum(protein, na.rm = TRUE),
+          total_fat = sum(total_fat, na.rm = TRUE)
+        ) %>%
+        ungroup()
+    )
+    
+    # Create bar chart for calories
+    calorie_plot <- ggplot(daily_totals, aes(x = food_log_date, y = total_calories)) +
+      geom_bar(stat = "identity", fill = "#fc8d62") +
+      labs(title = paste("Cal. v Day (P:", participant_id, ")"),
+           x = "Date", y = "Total Calories") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    
+    # Create bar chart for other nutrients
+    nutrients_plot <- suppressMessages(
+      daily_totals %>%
+        pivot_longer(cols = total_carbs:total_fat, names_to = "Nutrient", values_to = "Value") %>%
+        ggplot(aes(x = food_log_date, y = Value, fill = Nutrient)) +
+        geom_bar(stat = "identity", position = "stack") +
+        scale_fill_brewer(palette = "Set3") +
+        labs(title = paste("Nutr. vs Day (P:", participant_id, ")"),
+             x = "Date", y = "Total Value") +
+        theme_minimal() +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    )
+
+    # Combine plots for the participant
+    plots_list[[as.character(participant_id)]] <- calorie_plot / nutrients_plot
+  }
+  
+  # Return all generated plots
+  return(plots_list)
+}
+
+generate_corrMatrix <- function(participant_ids, con) {
+  # Initialize a list to store correlation matrices and heatmaps
+  results <- list()
+  
+  for (participant_id in participant_ids) {
+    # Query database for the participant's activity data
+    query <- paste0("SELECT * FROM get_participant_activity_data(", participant_id, ");")
+    activity_data <- dbGetQuery(con, query)
+    
+    # Ensure data is not empty
+    if (nrow(activity_data) == 0) {
+      warning(paste("No activity data available for participant", participant_id))
+      next
+    }
+    
+    # Select relevant columns for correlation
+    corr_data <- activity_data %>%
+      select(glucose_value_mgdl, avg_magnitude, average_hr, activity_intensity_score) %>%
+      na.omit()
+    
+    # Calculate correlation matrix
+    cor_matrix <- cor(corr_data)
+    
+    # Melt the correlation matrix for plotting
+    melted_corr <- melt(cor_matrix)
+    
+    # Generate heatmap
+    heatmap <- ggplot(data = melted_corr, aes(x = Var1, y = Var2, fill = value)) +
+      geom_tile(color = "white") +
+      scale_fill_gradient2(low = "#ff5757", high = "#42ff2a", mid = "grey95", midpoint = 0, limit = c(-1, 1)) +
+      theme_minimal() +
+      labs(
+        title = paste("Correlation Heatmap (Participant", participant_id, ")"),
+        x = "",
+        y = ""
+      ) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    
+    # Store the correlation matrix and heatmap
+    results[[as.character(participant_id)]] <- list(
+      correlation_matrix = cor_matrix,
+      heatmap = heatmap
+    )
+  }
+  
+  # Return the results list
+  return(results)
+}
+activity_clustering <- function(participant_id, con, k = 3, ...) {
+  # Step 1: Query the database for the participant's activity data
+  query <- paste0("SELECT * FROM get_participant_activity_data(", participant_id, ");")
+  activity_data <- dbGetQuery(con, query)
+  
+  # Ensure data is not empty
+  if (nrow(activity_data) == 0) {
+    stop(paste("No activity data available for participant", participant_id))
+  }
+
+  # Step 2: Select specified variables dynamically
+  vars <- enquos(...)
+  clustering_data <- activity_data %>%
+    select(!!!vars) %>%
+    na.omit()
+
+  # Scale the data for clustering
+  scaled_data <- scale(clustering_data)
+
+  # Step 3: Perform k-means clustering
+  set.seed(123) # For reproducibility
+  kmeans_result <- kmeans(scaled_data, centers = k, nstart = 25)
+
+  # Add numeric cluster labels to the original data
+  activity_data <- activity_data %>%
+    filter(complete.cases(select(., !!!vars))) %>%
+    mutate(cluster = kmeans_result$cluster)
+
+  # Step 4: Compare glucose levels across clusters (if glucose is selected)
+  if ("glucose_value_mgdl" %in% names(activity_data)) {
+    glucose_comparison <- activity_data %>%
+      group_by(cluster) %>%
+      summarise(
+        avg_glucose = mean(glucose_value_mgdl, na.rm = TRUE),
+        sd_glucose = sd(glucose_value_mgdl, na.rm = TRUE),
+        count = n()
+      )
+  } else {
+    glucose_comparison <- NULL
+  }
+
+  # Step 5: Visualization of clusters
+  # If more than 2 variables are used, plot the first two
+  plot_vars <- names(clustering_data)[1:2]
+  cluster_plot <- ggplot(activity_data, aes(x = !!sym(plot_vars[1]), y = !!sym(plot_vars[2]), color = factor(cluster))) +
+    geom_point(alpha = 0.7, size = 3) +
+    labs(
+      title = paste("Clustering (Participant", participant_id, ")"),
+      x = plot_vars[1],
+      y = plot_vars[2],
+      color = "Cluster"
+    ) +
+    theme_minimal()
+
+  # Return results
+  list(
+    cluster_summary = glucose_comparison,
+    cluster_plot = cluster_plot,
+    activity_data_with_clusters = activity_data
+  )
+}
+peak_analyze <- function(participant_id, con, threshold, recovery_window = 3) {
+  # Query activity data for the participant
+  query <- paste0("SELECT * FROM get_participant_activity_data(", participant_id, ");")
+  activity_data <- dbGetQuery(con, query)
+  
+  # Ensure data is not empty
+  if (nrow(activity_data) == 0) {
+    stop(paste("No activity data available for participant", participant_id))
+  }
+  
+  # Identify peaks where activity_intensity_score exceeds the threshold
+  activity_peaks <- activity_data %>%
+    filter(activity_intensity_score > threshold) %>%
+    arrange(activity_datetime) %>%
+    mutate(
+      peak_id = cumsum(c(TRUE, diff(as.numeric(activity_datetime)) > recovery_window * 3600))
+    )
+  
+  # Analyze glucose levels within the recovery window for each peak
+  recovery_analysis <- activity_peaks %>%
+    group_by(peak_id) %>%
+    summarise(
+      peak_time = min(activity_datetime),
+      peak_intensity = max(activity_intensity_score)
+    ) %>%
+    rowwise() %>%
+    mutate(
+      recovery_glucose = list(
+        activity_data %>%
+          filter(
+            activity_datetime >= peak_time & 
+            activity_datetime <= (peak_time + as.difftime(recovery_window, units = "hours"))
+          ) %>%
+          select(activity_datetime, glucose_value_mgdl, average_hr, activity_intensity_score)
+      )
+    )
+  
+  # Prepare data for Plotly timeline
+  all_traces <- list()
+  
+  for (i in seq_len(nrow(recovery_analysis))) {
+    recovery_data <- recovery_analysis$recovery_glucose[[i]]
+    
+    # Add glucose trace with dynamic title
+    all_traces[[length(all_traces) + 1]] <- list(
+      x = recovery_data$activity_datetime,
+      y = recovery_data$glucose_value_mgdl,
+      name = paste("Peak", recovery_analysis$peak_id[i], "- Glucose"),
+      type = "scatter",
+      mode = "lines",
+      line = list(color = "blue", width = 6), # Thicker blue line
+      smoothing = 1.8 # Optional smoothing for curves
+    )
+    
+    # Add heart rate trace
+    all_traces[[length(all_traces) + 1]] <- list(
+      x = recovery_data$activity_datetime,
+      y = recovery_data$average_hr,
+      name = paste("Peak", recovery_analysis$peak_id[i], "- Heart Rate"),
+      type = "scatter",
+      mode = "lines",
+      line = list(color = "rgba(255, 0, 0, 0.2)") # Transparent red
+    )
+    
+    # Add activity intensity trace
+    all_traces[[length(all_traces) + 1]] <- list(
+      x = recovery_data$activity_datetime,
+      y = recovery_data$activity_intensity_score,
+      name = paste("Peak", recovery_analysis$peak_id[i], "- Activity Intensity"),
+      type = "scatter",
+      mode = "lines",
+      line = list(color = "rgba(0, 128, 0, 0.3)") # Transparent green
+    )
+  }
+
+  # Create slider steps for interactivity
+  steps <- lapply(seq_len(nrow(recovery_analysis)), function(i) {
+    list(
+      method = "update",
+      args = list(
+        list(visible = c(rep(FALSE, (i - 1) * 3), TRUE, TRUE, TRUE, rep(FALSE, (nrow(recovery_analysis) - i) * 3))),
+        list(title = paste("Recovery After Peak", recovery_analysis$peak_id[i],
+                           "(Activity Intensity:", recovery_analysis$peak_intensity[i], ")"))
+      ),
+      label = paste("Peak", recovery_analysis$peak_id[i])
+    )
+  })
+
+  # Build the Plotly figure
+  fig <- plot_ly()
+  
+  for (trace in all_traces) {
+    fig <- fig %>% add_trace(x = trace$x, y = trace$y, type = trace$type, mode = trace$mode, name = trace$name, line = trace$line)
+  }
+  
+  fig <- fig %>%
+    layout(
+      title = paste("Glucose and Heart Rate Recovery After Peaks (Participant", participant_id, ")"),
+      xaxis = list(title = "Time"),
+      yaxis = list(title = "Value"),
+      autosize = TRUE,
+      sliders = list(
+        list(
+          active = 0,
+          steps = steps
+        )
+      )
+    ) %>%
+  config(
+    responsive = TRUE # Enables responsiveness for dynamic resizing
+  )
+  
+  return(fig)
+}
+# Function to fetch data for multiple participants
+get_participant_data_claudeai <- function(con, participant_ids) {
+  # Initialize empty list to store data frames
+  participant_data <- list()
+  
+  # Fetch data for each participant
+  for (id in participant_ids) {
+    query <- sprintf("SELECT * FROM get_participant_food_data(%d);", id)
+    participant_data[[as.character(id)]] <- dbGetQuery(con, query) %>%
+      mutate(participant_id = id)  # Add participant ID column
+  }
+  
+  # Combine all data frames
+  do.call(rbind, participant_data)
+}
+
+# Data preparation function (enhanced version)
+prepare_nutrition_data_enhanced <- function(df) {
+  df %>%
+    mutate(
+      dexcom_datetime = ymd_hms(dexcom_datetime),
+      food_log_datetime = ymd_hms(paste(food_log_date, food_log_time)),
+      # Calculate time since meal for each glucose reading
+      time_since_meal = as.numeric(difftime(dexcom_datetime, food_log_datetime, units = "mins")),
+      # Create meal categories
+      meal_category = case_when(
+        hour(food_log_datetime) < 11 ~ "Breakfast",
+        hour(food_log_datetime) < 16 ~ "Lunch",
+        TRUE ~ "Dinner"
+      ),
+      # Calculate macro ratios
+      carb_ratio = total_carb / (total_carb + protein + total_fat),
+      protein_ratio = protein / (total_carb + protein + total_fat),
+      fat_ratio = total_fat / (total_carb + protein + total_fat)
+    )
+}
+
+# Enhanced plotting function for multiple participants
+plot_daily_patterns_enhanced <- function(df, facet = TRUE) {
+  base_plot <- df %>%
+    ggplot(aes(x = hour(food_log_datetime), y = glucose_value_mgdl)) +
+    geom_point(aes(color = total_carb, size = calorie), alpha = 0.6) +
+    geom_smooth(method = "loess", color = "blue") +
+    scale_color_viridis_c("Total Carbs (g)") +
+    theme_minimal() +
+    labs(
+      title = "Daily Glucose Patterns with Meal Information",
+      x = "Hour of Day",
+      y = "Glucose (mg/dL)",
+      size = "Calories"
+    ) +
+    scale_x_continuous(breaks = 0:23)
+    
+  if (facet) {
+    base_plot + facet_wrap(~participant_id, scales = "free_y")
+  } else {
+    base_plot
+  }
+}
+
+# Function for combined view with participant differentiation
+plot_daily_patterns_combined_2 <- function(df) {
+  df %>%
+    filter(!is.na(glucose_value_mgdl)) %>%
+    ggplot(aes(x = hour(food_log_datetime), y = glucose_value_mgdl, 
+               color = factor(participant_id))) +
+    geom_point(aes(size = total_carb), alpha = 0.6) +
+    geom_smooth(method = "loess", se = TRUE) +
+    scale_color_viridis_d("Participant ID") +
+    scale_size_continuous("Total Carbs (g)") +
+    theme_minimal() +
+    theme(
+      legend.position = "right",
+      plot.title = element_text(size = 14, face = "bold")
+    ) +
+    labs(
+      title = "Combined Daily Glucose Patterns",
+      x = "Hour of Day",
+      y = "Glucose (mg/dL)"
+    ) +
+    scale_x_continuous(breaks = seq(0, 24, by = 4))
+}
+
+
+# Function to analyze glucose response patterns
+analyze_glucose_response_claudeai <- function(df) {
+  df %>%
+    group_by(participant_id, meal_category) %>%
+    summarise(
+      avg_glucose = mean(glucose_value_mgdl, na.rm = TRUE),
+      max_glucose = max(glucose_value_mgdl, na.rm = TRUE),
+      avg_carbs = mean(total_carb, na.rm = TRUE),
+      n_meals = n_distinct(food_log_datetime),
+      .groups = "drop"
+    )
+}
+
+```
+
+
+
